@@ -1,8 +1,9 @@
 """
 tcp_server.py – AISR robot teleoperation server.
 
-Listens on a TCP socket and processes newline-delimited JSON messages
-using the shared protocol from src.protocol.
+Listens on a TCP socket, processes newline-delimited JSON messages via
+the shared protocol, and dispatches commands through the safety
+controller to the robot backend.
 
 Run from the project root:
     python -m src.tcp_server
@@ -10,30 +11,24 @@ Run from the project root:
 
 import socket
 import sys
+import threading
 
 from src.protocol import MessageBuffer, encode_message
+from src.robot_interface import MockRobot
+from src.safety import SafetyConfig, SafetyController
 
 HOST = "127.0.0.1"
 PORT = 5000
 RECV_SIZE = 4096
-SOCKET_TIMEOUT = 120  # seconds – drop idle clients after 2 minutes
+SOCKET_TIMEOUT = 0.5  # short timeout so watchdog isn't blocked by recv()
 
 
 def handle_message(message: dict) -> dict:
-    """Build a response for a single validated message.
+    """Legacy simple handler kept for backward-compatible tests.
 
-    Parameters
-    ----------
-    message : dict
-        A decoded protocol message (guaranteed to have a ``type`` key).
-
-    Returns
-    -------
-    dict
-        A JSON-serialisable response dictionary.
+    The real server uses ``SafetyController.dispatch()`` instead.
     """
     msg_type: str = message["type"]
-
     return {
         "type": "ACK",
         "received_type": msg_type,
@@ -41,11 +36,16 @@ def handle_message(message: dict) -> dict:
     }
 
 
-def serve_client(conn: socket.socket, address: tuple) -> None:
+def serve_client(
+    conn: socket.socket,
+    address: tuple,
+    controller: SafetyController,
+) -> None:
     """Read protocol messages from *conn* and send responses.
 
-    Uses :class:`MessageBuffer` to handle TCP framing correctly:
-    partial reads, or multiple messages arriving in one ``recv()``.
+    Uses :class:`MessageBuffer` to handle TCP framing correctly.
+    The short socket timeout allows the heartbeat watchdog to keep
+    running even when no data arrives.
 
     Parameters
     ----------
@@ -53,6 +53,8 @@ def serve_client(conn: socket.socket, address: tuple) -> None:
         The accepted client connection.
     address : tuple
         ``(host, port)`` of the remote client.
+    controller : SafetyController
+        The safety controller managing state and robot commands.
     """
     print(f"Connected to client: {address}")
     conn.settimeout(SOCKET_TIMEOUT)
@@ -63,7 +65,11 @@ def serve_client(conn: socket.socket, address: tuple) -> None:
             try:
                 data: bytes = conn.recv(RECV_SIZE)
             except socket.timeout:
-                print("Client timed out.")
+                # No data this cycle — watchdog keeps running in its
+                # own thread, so we just loop back to recv().
+                continue
+            except OSError:
+                # Socket closed or broken.
                 break
 
             if not data:
@@ -73,19 +79,31 @@ def serve_client(conn: socket.socket, address: tuple) -> None:
             buffer.feed(data)
 
             for message in buffer.get_messages():
-                print(f"Received: {message}")
-                response: dict = handle_message(message)
-                conn.sendall(encode_message(response))
+                msg_type = message.get("type", "")
+                if msg_type.upper() != "HEARTBEAT":
+                    print(f"Received: {message}")
+
+                response: dict = controller.dispatch(message)
+                try:
+                    conn.sendall(encode_message(response))
+                except OSError:
+                    # Client disconnected while we were responding.
+                    return
 
     except ConnectionResetError:
         print("Client connection reset.")
     finally:
+        controller.on_client_disconnect()
         conn.close()
-        print(f"Client {address} disconnected.")
+        print(f"Client {address} disconnected. Robot stopped.")
 
 
 def main() -> None:
     """Start the TCP server and accept a single client."""
+    robot = MockRobot()
+    controller = SafetyController(robot)
+    controller.start_watchdog()
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((HOST, PORT))
@@ -98,10 +116,14 @@ def main() -> None:
             conn, address = server.accept()
         except KeyboardInterrupt:
             print("\nServer shut down.")
+            controller.stop_watchdog()
             sys.exit(0)
 
         with conn:
-            serve_client(conn, address)
+            serve_client(conn, address, controller)
+
+    controller.stop_watchdog()
+    print("Server exited.")
 
 
 if __name__ == "__main__":
