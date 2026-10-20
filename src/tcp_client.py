@@ -9,6 +9,7 @@ Run from the project root:
 """
 
 import json
+import math
 import socket
 import sys
 import threading
@@ -88,19 +89,19 @@ def _reader_loop(
 
 _HELP_TEXT = """
 Available commands:
-  FORWARD [speed]       – Move forward (default 0.5 m/s)
-  BACKWARD [speed]      – Move backward
-  TURN_LEFT [speed]     – Turn left (default 45 deg/s)
-  TURN_RIGHT [speed]    – Turn right
-  MOVE <linear> <angular> – Set velocities directly
-  GOTO <x> <y>          – Navigate to coordinates
-  STOP                  – Stop the robot
-  STATUS                – Query robot state
-  ESTOP                 – Emergency stop (latched)
-  RESET                 – Clear emergency stop
-  PING                  – Basic ping
-  help                  – Show this help
-  quit                  – Disconnect
+  FORWARD [speed] [duration]   – Move forward (default 0.5 m/s; duration in seconds, continuous if omitted)
+  BACKWARD [speed] [duration]  – Move backward (duration in seconds, continuous if omitted)
+  TURN_LEFT [speed] [duration] – Turn left (default 45 deg/s)
+  TURN_RIGHT [speed] [duration]– Turn right
+  MOVE <linear> <angular>      – Set velocities directly
+  GOTO <x> <y>                 – Navigate to coordinates
+  STOP                         – Stop the robot
+  STATUS                       – Query robot state
+  ESTOP                        – Emergency stop (latched)
+  RESET                        – Clear emergency stop
+  PING                         – Basic ping
+  help                         – Show this help
+  quit                         – Disconnect
 """
 
 
@@ -119,26 +120,60 @@ def _parse_user_command(user_input: str) -> dict | None:
     if cmd in ("STOP", "STATUS", "ESTOP", "RESET", "PING", "HEARTBEAT"):
         return {"type": cmd}
 
-    # FORWARD / BACKWARD [speed]
+    # FORWARD / BACKWARD [speed] [duration]
     if cmd in ("FORWARD", "BACKWARD"):
+        if len(parts) > 3:
+            print(f"  Usage: {cmd} [speed] [duration]")
+            return None
         msg: dict = {"type": cmd}
         if len(parts) >= 2:
             try:
-                msg["speed"] = float(parts[1])
+                speed = float(parts[1])
             except ValueError:
                 print(f"  Invalid speed: {parts[1]}")
                 return None
+            if speed <= 0 or math.isnan(speed) or math.isinf(speed):
+                print(f"  Speed must be a positive finite number, got {parts[1]}")
+                return None
+            msg["speed"] = speed
+        if len(parts) == 3:
+            try:
+                duration = float(parts[2])
+            except ValueError:
+                print(f"  Invalid duration: {parts[2]}")
+                return None
+            if duration <= 0 or math.isnan(duration) or math.isinf(duration):
+                print(f"  Duration must be a positive finite number, got {parts[2]}")
+                return None
+            msg["duration"] = duration
         return msg
 
-    # TURN_LEFT / TURN_RIGHT [speed]
+    # TURN_LEFT / TURN_RIGHT [speed] [duration]
     if cmd in ("TURN_LEFT", "TURN_RIGHT"):
+        if len(parts) > 3:
+            print(f"  Usage: {cmd} [speed] [duration]")
+            return None
         msg = {"type": cmd}
         if len(parts) >= 2:
             try:
-                msg["speed"] = float(parts[1])
+                speed = float(parts[1])
             except ValueError:
                 print(f"  Invalid speed: {parts[1]}")
                 return None
+            if speed <= 0 or math.isnan(speed) or math.isinf(speed):
+                print(f"  Speed must be a positive finite number, got {parts[1]}")
+                return None
+            msg["speed"] = speed
+        if len(parts) == 3:
+            try:
+                duration = float(parts[2])
+            except ValueError:
+                print(f"  Invalid duration: {parts[2]}")
+                return None
+            if duration <= 0 or math.isnan(duration) or math.isinf(duration):
+                print(f"  Duration must be a positive finite number, got {parts[2]}")
+                return None
+            msg["duration"] = duration
         return msg
 
     # MOVE <linear> <angular>

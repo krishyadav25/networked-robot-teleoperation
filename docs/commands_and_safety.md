@@ -33,10 +33,11 @@ The robot teleoperation system is structured into layered, decoupled components:
 +------------------------------+------------------------------+
                                |
 +------------------------------v------------------------------+
-|               RobotInterface / MockRobot Backend            |
+|               RobotInterface Backend Layer                   |
 |  - Abstract hardware abstraction layer                      |
-|  - Thread-safe command logging and simulated kinematics    |
-|  - Drop-in interface ready for CoppeliaSim Pioneer P3-DX    |
+|  - MockRobot: in-memory command logging & test double       |
+|  - CoppeliaSimRobot: ZeroMQ Remote API Pioneer P3-DX        |
+|  - Selection via create_robot_backend(mock | coppeliasim)   |
 +-------------------------------------------------------------+
 ```
 
@@ -115,10 +116,10 @@ All messages are UTF-8 newline-delimited JSON objects (`\n`).
 | Command | Arguments | Example Payload | Example Response |
 | :--- | :--- | :--- | :--- |
 | **`HEARTBEAT`** | None | `{"type": "HEARTBEAT"}` | `{"type": "HEARTBEAT_ACK", "state": "IDLE", "status": "ok"}` |
-| **`FORWARD`** | `speed` (opt, float ≥ 0) | `{"type": "FORWARD", "speed": 1.0}` | `{"type": "FORWARD_ACK", "state": "MOVING", "status": "ok", "speed": 1.0}` |
-| **`BACKWARD`** | `speed` (opt, float ≥ 0) | `{"type": "BACKWARD", "speed": 0.5}` | `{"type": "BACKWARD_ACK", "state": "MOVING", "status": "ok", "speed": 0.5}` |
-| **`TURN_LEFT`** | `speed` (opt, float ≥ 0) | `{"type": "TURN_LEFT", "speed": 30.0}` | `{"type": "TURN_LEFT_ACK", "state": "MOVING", "status": "ok", "speed": 30.0}` |
-| **`TURN_RIGHT`** | `speed` (opt, float ≥ 0) | `{"type": "TURN_RIGHT", "speed": 45.0}` | `{"type": "TURN_RIGHT_ACK", "state": "MOVING", "status": "ok", "speed": 45.0}` |
+| **`FORWARD`** | `speed` (opt, float > 0), `duration` (opt, float > 0) | `{"type": "FORWARD", "speed": 1.0, "duration": 2.0}` | `{"type": "FORWARD_ACK", "state": "MOVING", "status": "ok", "speed": 1.0, "duration": 2.0}` |
+| **`BACKWARD`** | `speed` (opt, float > 0), `duration` (opt, float > 0) | `{"type": "BACKWARD", "speed": 0.5, "duration": 1.5}` | `{"type": "BACKWARD_ACK", "state": "MOVING", "status": "ok", "speed": 0.5, "duration": 1.5}` |
+| **`TURN_LEFT`** | `speed` (opt, float > 0), `duration` (opt, float > 0) | `{"type": "TURN_LEFT", "speed": 30.0, "duration": 1.0}` | `{"type": "TURN_LEFT_ACK", "state": "MOVING", "status": "ok", "speed": 30.0, "duration": 1.0}` |
+| **`TURN_RIGHT`** | `speed` (opt, float > 0), `duration` (opt, float > 0) | `{"type": "TURN_RIGHT", "speed": 45.0, "duration": 2.0}` | `{"type": "TURN_RIGHT_ACK", "state": "MOVING", "status": "ok", "speed": 45.0, "duration": 2.0}` |
 | **`MOVE`** | `linear` (float), `angular` (float) | `{"type": "MOVE", "linear": 1.2, "angular": -30.0}` | `{"type": "MOVE_ACK", "state": "MOVING", "status": "ok", "linear": 1.2, "angular": -30.0}` |
 | **`GOTO`** | `x` (float), `y` (float) | `{"type": "GOTO", "x": 5.0, "y": 10.0}` | `{"type": "GOTO_ACK", "state": "MOVING", "status": "ok", "target_x": 5.0, "target_y": 10.0}` |
 | **`STOP`** | None | `{"type": "STOP"}` | `{"type": "STOP_ACK", "state": "IDLE", "status": "ok"}` |
@@ -127,19 +128,44 @@ All messages are UTF-8 newline-delimited JSON objects (`\n`).
 | **`RESET`** | None | `{"type": "RESET"}` | `{"type": "RESET_ACK", "state": "IDLE", "status": "ok", ...}` |
 | **`PING`** | None | `{"type": "PING"}` | `{"type": "ACK", "received_type": "PING", "status": "ok", "state": "IDLE"}` |
 
+### Continuous vs. Timed Movement
+
+The teleoperation protocol supports two distinct movement modes:
+
+1. **Continuous Motion (Default):**
+   - Triggered when `duration` is omitted (e.g. `FORWARD 0.5` or `FORWARD`).
+   - The robot commands the velocity and transitions to `MOVING`.
+   - Motion continues indefinitely until explicitly stopped by `STOP`, `ESTOP`, `RESET`, client disconnect, or heartbeat watchdog timeout.
+2. **Timed Motion:**
+   - Triggered when optional positive duration (in seconds) is provided (e.g. `FORWARD 0.1 1.0` or `BACKWARD 0.2 2.5`).
+   - The robot starts moving and schedules a high-precision concurrency-safe timer.
+   - When the duration expires, the robot automatically halts (`stop()`) and transitions back to `IDLE`.
+   - An ACK containing `"duration": <seconds>` confirms timed execution.
+
+### Safe Timed Motion & Concurrency Guarantees
+
+To ensure rock-solid safety in multi-threaded network environments:
+- **Generation Counter:** Every motion timer is stamped with a monotonic generation ID (`_motion_generation`). When any new motion command is received, the previous timer is cancelled and the generation increments.
+- **Stale Timer Immunity:** If a timer fires late after being superseded by another movement, it detects a generation mismatch and exits immediately without altering robot state or stopping the new motion.
+- **Safety Overrides:** `STOP`, `ESTOP`, `RESET`, client disconnect (`on_client_disconnect`), heartbeat watchdog timeout (`COMM_LOST`), and server shutdown all cancel any active timers and ensure the robot is stopped immediately.
+
 ---
 
 ## 6. Input Validation & Numeric Safety Limits
 
 The safety controller rigorously validates all command parameters before dispatch:
 
-- **Type Checking:** Rejects non-numeric types and booleans (`True`/`False` are not valid velocities).
+- **Type Checking:** Rejects non-numeric types and booleans (`True`/`False` are not valid velocities or durations).
 - **Non-Finite Number Rejection:** Rejects `NaN`, `+Infinity`, and `-Infinity`.
-- **Sign Validation:** Directional commands (`FORWARD`, `BACKWARD`, `TURN_LEFT`, `TURN_RIGHT`) enforce non-negative speeds (`speed >= 0`). `MOVE` allows signed values for dual-axis driving.
+- **Sign & Duration Validation:**
+  - Directional commands enforce non-negative speeds (`speed >= 0`).
+  - Duration, when provided, must be strictly positive (`duration > 0`), finite, and non-boolean.
+  - Excessive durations exceeding `max_duration = 300.0`s are rejected.
 - **Configurable Thresholds (`SafetyConfig`):**
   - Linear velocity limit: `max_linear_speed = 2.0` m/s (`|v| ≤ 2.0`).
   - Angular velocity limit: `max_angular_speed = 90.0` deg/s (`|ω| ≤ 90.0`).
   - Coordinate range limit: `max_goto_range = 1000.0` m (`|x|, |y| ≤ 1000.0`).
+  - Maximum motion duration: `max_duration = 300.0` s.
   - Default linear speed: `default_speed = 0.5` m/s.
   - Default angular speed: `default_turn_speed = 45.0` deg/s.
 
@@ -177,7 +203,7 @@ Heartbeat ACKs (`HEARTBEAT_ACK`) are received and processed silently in the back
 
 ## 8. Verification & Test Suite
 
-The test suite consists of **103 automated tests** across two test modules:
+The test suite consists of **171 automated tests** across three test modules:
 
 1. **`tests/test_protocol.py` (32 tests):**
    - JSON newline framing and encoding/decoding.
@@ -185,10 +211,14 @@ The test suite consists of **103 automated tests** across two test modules:
    - `MessageBuffer` fragmented streaming, partial messages, and multiple frames per packet.
    - End-to-end TCP loopback socket integration.
 
-2. **`tests/test_safety.py` (71 tests):**
+2. **`tests/test_safety.py` (98 tests):**
    - Initial state and stationary verification.
    - Movement commands (`FORWARD`, `BACKWARD`, `TURN_LEFT`, `TURN_RIGHT`, `MOVE`, `GOTO`, `STOP`).
-   - Command validation, negative speeds, bounds checking, boolean and NaN/Inf rejection.
+   - Timed movement execution, duration expiry, and transition to `IDLE`.
+   - Concurrency safety: newer movement superseding and cancelling older timers.
+   - Stale timer immunity preventing late callbacks from stopping new motion.
+   - Timer cancellation on `STOP`, `ESTOP`, `RESET`, client disconnect, watchdog timeout, and server shutdown.
+   - Command validation: negative speeds, duration validation, bounds checking, boolean and NaN/Inf rejection.
    - Deterministic watchdog expiry and refresh via injectable `FakeClock`.
    - Recovery without automatic resumption of motion.
    - Emergency-stop latching, motion blockage, and idempotent calls.
@@ -196,6 +226,20 @@ The test suite consists of **103 automated tests** across two test modules:
    - Client disconnect stopping robot and retaining E-stop priority.
    - Independent background watchdog thread execution with short timeout.
    - Real TCP integration with `SafetyController`.
+
+3. **`tests/test_coppeliasim.py` (41 tests):**
+   - Scene object resolution (`PioneerP3DX`, `leftMotor`, `rightMotor`) via exact paths, relative proxies, and aliases.
+   - Differential drive wheel speed calculation ($R=0.0975\text{ m}, L=0.331\text{ m}$) across forward, backward, left, right, and dual velocities.
+   - Wheel velocity limits clamping with curvature preservation.
+   - Zero-velocity stop operation leaving simulator clock unchanged.
+   - Simulation state handling (stopped, paused, running, auto-start).
+   - Backend factory selection (`mock` vs `coppeliasim`) without silent fallback.
+   - Status reporting accuracy: zero physical velocity and stationary flag when simulation is stopped or paused.
+   - Normalization of IEEE `-0.0` floating point artifacts and sensor deadband jitter filtering.
+   - Live status reporting translation to `RobotStatus`.
+   - Safety controller integration with simulated Pioneer joints.
+
+For complete CoppeliaSim integration details, setup steps, and running instructions, see [CoppeliaSim Pioneer P3-DX Integration Guide](file:///d:/AISR-Project/docs/coppeliasim_integration.md).
 
 Run the full suite using:
 ```bash

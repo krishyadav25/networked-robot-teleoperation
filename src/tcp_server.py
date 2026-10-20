@@ -9,12 +9,13 @@ Run from the project root:
     python -m src.tcp_server
 """
 
+import os
 import socket
 import sys
 import threading
 
 from src.protocol import MessageBuffer, encode_message
-from src.robot_interface import MockRobot
+from src.robot_interface import MockRobot, create_robot_backend
 from src.safety import SafetyConfig, SafetyController
 
 HOST = "127.0.0.1"
@@ -100,7 +101,19 @@ def serve_client(
 
 def main() -> None:
     """Start the TCP server and accept a single client."""
-    robot = MockRobot()
+    backend_choice = os.environ.get("AISR_ROBOT_BACKEND", "mock")
+    # Parse CLI arguments (e.g. --backend coppeliasim)
+    for i, arg in enumerate(sys.argv):
+        if arg in ("--backend", "-b") and i + 1 < len(sys.argv):
+            backend_choice = sys.argv[i + 1]
+
+    print(f"Initializing robot backend: '{backend_choice}'")
+    try:
+        robot = create_robot_backend(backend_choice)
+    except Exception as exc:
+        print(f"Fatal error initializing robot backend '{backend_choice}': {exc}", file=sys.stderr)
+        sys.exit(1)
+
     controller = SafetyController(robot)
     controller.start_watchdog()
 
@@ -109,7 +122,7 @@ def main() -> None:
         server.bind((HOST, PORT))
         server.listen(1)
 
-        print(f"AISR server listening on {HOST}:{PORT}")
+        print(f"AISR server listening on {HOST}:{PORT} (backend: {backend_choice})")
         print("Waiting for the operator client...")
 
         try:

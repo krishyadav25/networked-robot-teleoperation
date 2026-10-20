@@ -13,10 +13,12 @@ import socket
 import threading
 import time
 import unittest
+from typing import Callable
 
 from src.protocol import MessageBuffer, encode_message
 from src.robot_interface import MockRobot, RobotStatus
 from src.safety import RobotState, SafetyConfig, SafetyController
+from src.tcp_client import _parse_user_command
 
 
 # ============================================================================
@@ -35,6 +37,42 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self._now += seconds
+
+
+class FakeTimer:
+    """A controllable mock timer for deterministic timed motion testing."""
+
+    def __init__(self, delay: float, callback: Callable[[], None]) -> None:
+        self.delay = delay
+        self.callback = callback
+        self.started = False
+        self.cancelled = False
+
+    def start(self) -> None:
+        self.started = True
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def trigger(self) -> None:
+        if not self.cancelled:
+            self.callback()
+
+
+class FakeTimerFactory:
+    """Factory tracking created FakeTimer instances."""
+
+    def __init__(self) -> None:
+        self.timers: list[FakeTimer] = []
+
+    def __call__(self, delay: float, callback: Callable[[], None]) -> FakeTimer:
+        timer = FakeTimer(delay, callback)
+        self.timers.append(timer)
+        return timer
+
+    @property
+    def latest(self) -> FakeTimer | None:
+        return self.timers[-1] if self.timers else None
 
 
 def make_controller(
@@ -834,6 +872,277 @@ class TestAdvancedSafetyEdgeCases(unittest.TestCase):
         clock.advance(2.0)
         ctrl._check_watchdog()
         self.assertEqual(ctrl.state, RobotState.COMM_LOST)
+
+
+# ============================================================================
+# 16. Duration Parsing in Client
+# ============================================================================
+
+
+class TestDurationParsing(unittest.TestCase):
+    """Verify that _parse_user_command correctly parses or rejects durations."""
+
+    def test_parse_forward_with_duration(self):
+        msg = _parse_user_command("FORWARD 0.5 2")
+        self.assertEqual(msg, {"type": "FORWARD", "speed": 0.5, "duration": 2.0})
+
+    def test_parse_forward_without_duration(self):
+        msg = _parse_user_command("FORWARD 0.5")
+        self.assertEqual(msg, {"type": "FORWARD", "speed": 0.5})
+
+    def test_parse_forward_default_speed(self):
+        msg = _parse_user_command("FORWARD")
+        self.assertEqual(msg, {"type": "FORWARD"})
+
+    def test_parse_backward_with_duration(self):
+        msg = _parse_user_command("BACKWARD 0.3 1.5")
+        self.assertEqual(msg, {"type": "BACKWARD", "speed": 0.3, "duration": 1.5})
+
+    def test_parse_turn_left_with_duration(self):
+        msg = _parse_user_command("TURN_LEFT 30 2")
+        self.assertEqual(msg, {"type": "TURN_LEFT", "speed": 30.0, "duration": 2.0})
+
+    def test_parse_turn_right_with_duration(self):
+        msg = _parse_user_command("TURN_RIGHT 45 3")
+        self.assertEqual(msg, {"type": "TURN_RIGHT", "speed": 45.0, "duration": 3.0})
+
+    def test_reject_negative_duration(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 -1"))
+
+    def test_reject_zero_duration(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 0"))
+
+    def test_reject_non_numeric_duration(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 abc"))
+
+    def test_reject_nan_duration(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 nan"))
+
+    def test_reject_inf_duration(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 inf"))
+
+    def test_reject_extra_arguments(self):
+        self.assertIsNone(_parse_user_command("FORWARD 0.5 1.0 extra"))
+
+
+# ============================================================================
+# 17. Timed Motion and Concurrency Safety
+# ============================================================================
+
+
+class TestTimedMotion(unittest.TestCase):
+    """Verify safe timed motion, expiry, cancellation, and stale timer handling."""
+
+    def setUp(self):
+        self.timer_factory = FakeTimerFactory()
+        self.robot = MockRobot()
+        self.clock = FakeClock()
+        self.ctrl = SafetyController(
+            self.robot,
+            clock=self.clock,
+            timer_factory=self.timer_factory,
+        )
+
+    def test_duration_expiry_stops_robot(self):
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 2.0})
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(resp["duration"], 2.0)
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+        self.assertTrue(self.robot.get_status().is_moving)
+
+        timer = self.timer_factory.latest
+        self.assertIsNotNone(timer)
+        self.assertEqual(timer.delay, 2.0)
+        self.assertTrue(timer.started)
+        self.assertFalse(timer.cancelled)
+
+        # Trigger timer expiry
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+        self.assertFalse(self.robot.get_status().is_moving)
+        self.assertEqual(self.robot.get_status().linear_velocity, 0.0)
+
+    def test_backward_timed_motion(self):
+        resp = self.ctrl.dispatch({"type": "BACKWARD", "speed": 0.3, "duration": 1.5})
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(resp["duration"], 1.5)
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+
+        timer = self.timer_factory.latest
+        self.assertIsNotNone(timer)
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+    def test_turn_timed_motion(self):
+        resp = self.ctrl.dispatch({"type": "TURN_LEFT", "speed": 30.0, "duration": 1.0})
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(resp["duration"], 1.0)
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+
+        timer = self.timer_factory.latest
+        self.assertIsNotNone(timer)
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+    def test_continuous_motion_when_duration_omitted(self):
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5})
+        self.assertEqual(resp["status"], "ok")
+        self.assertNotIn("duration", resp)
+        self.assertEqual(len(self.timer_factory.timers), 0)
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+
+    def test_new_movement_supersedes_and_cancels_older_timer(self):
+        # 1st command with duration
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 5.0})
+        timer1 = self.timer_factory.latest
+        self.assertFalse(timer1.cancelled)
+
+        # 2nd command supersedes 1st command
+        self.ctrl.dispatch({"type": "BACKWARD", "speed": 0.2, "duration": 2.0})
+        self.assertTrue(timer1.cancelled)
+        timer2 = self.timer_factory.latest
+        self.assertIsNot(timer1, timer2)
+        self.assertFalse(timer2.cancelled)
+
+        # Stale timer1 trigger must NOT stop the robot
+        timer1.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+        self.assertTrue(self.robot.get_status().is_moving)
+        self.assertEqual(self.robot.get_status().linear_velocity, -0.2)
+
+        # Proper timer2 trigger stops the robot
+        timer2.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+    def test_continuous_movement_cancels_older_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 5.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        # Continuous FORWARD
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.8})
+        self.assertTrue(timer.cancelled)
+
+        # Late timer trigger does nothing
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+        self.assertEqual(self.robot.get_status().linear_velocity, 0.8)
+
+    def test_stale_timer_does_not_stop_newer_movement(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 2.0})
+        stale_gen = self.ctrl._motion_generation
+
+        # Superseded by second command
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.8, "duration": 4.0})
+
+        # Directly invoke expired callback with the stale generation
+        self.ctrl._on_motion_timer_expired(stale_gen)
+
+        # Robot must STILL be moving at the new command's speed
+        self.assertEqual(self.ctrl.state, RobotState.MOVING)
+        self.assertEqual(self.robot.get_status().linear_velocity, 0.8)
+
+    def test_stop_cancels_pending_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 3.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        resp = self.ctrl.dispatch({"type": "STOP"})
+        self.assertEqual(resp["status"], "ok")
+        self.assertTrue(timer.cancelled)
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+
+    def test_estop_cancels_pending_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 3.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        resp = self.ctrl.dispatch({"type": "ESTOP"})
+        self.assertEqual(resp["type"], "ESTOP_ACK")
+        self.assertTrue(timer.cancelled)
+        self.assertEqual(self.ctrl.state, RobotState.ESTOP_LATCHED)
+
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.ESTOP_LATCHED)
+
+    def test_reset_cancels_pending_timer_and_leaves_robot_stopped(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 3.0})
+        self.ctrl.dispatch({"type": "ESTOP"})
+        resp = self.ctrl.dispatch({"type": "RESET"})
+        self.assertEqual(resp["status"], "ok")
+        self.assertEqual(self.ctrl.state, RobotState.IDLE)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+    def test_disconnect_cancels_pending_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 3.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        self.ctrl.on_client_disconnect()
+        self.assertTrue(timer.cancelled)
+        self.assertEqual(self.ctrl.state, RobotState.COMM_LOST)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.COMM_LOST)
+
+    def test_watchdog_timeout_cancels_pending_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 10.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        self.clock.advance(2.0)
+        self.ctrl._check_watchdog()
+        self.assertTrue(timer.cancelled)
+        self.assertEqual(self.ctrl.state, RobotState.COMM_LOST)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+        timer.trigger()
+        self.assertEqual(self.ctrl.state, RobotState.COMM_LOST)
+
+    def test_server_shutdown_cancels_pending_timer(self):
+        self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 5.0})
+        timer = self.timer_factory.latest
+        self.assertFalse(timer.cancelled)
+
+        self.ctrl.stop_watchdog()
+        self.assertTrue(timer.cancelled)
+        self.assertFalse(self.robot.get_status().is_moving)
+
+    def test_duration_validation_rejections(self):
+        # Negative duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": -1.0})
+        self.assertEqual(resp["status"], "invalid")
+
+        # Zero duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 0.0})
+        self.assertEqual(resp["status"], "invalid")
+
+        # NaN duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": float("nan")})
+        self.assertEqual(resp["status"], "invalid")
+
+        # Inf duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": float("inf")})
+        self.assertEqual(resp["status"], "invalid")
+
+        # Non-numeric duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": "five"})
+        self.assertEqual(resp["status"], "invalid")
+
+        # Boolean duration
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": True})
+        self.assertEqual(resp["status"], "invalid")
+
+        # Excessive duration (> max_duration)
+        resp = self.ctrl.dispatch({"type": "FORWARD", "speed": 0.5, "duration": 99999.0})
+        self.assertEqual(resp["status"], "invalid")
 
 
 if __name__ == "__main__":
