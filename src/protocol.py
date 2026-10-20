@@ -122,3 +122,62 @@ def decode_message(data: bytes) -> dict:
         )
 
     return parsed
+
+
+class MessageBuffer:
+    """Accumulate raw TCP bytes and yield complete protocol messages.
+
+    TCP is a byte-stream protocol: a single ``recv()`` call may deliver
+    a partial message, exactly one message, or several messages glued
+    together.  This class buffers incoming bytes and splits them on the
+    newline delimiter so that callers always get whole, validated
+    messages.
+
+    Usage
+    -----
+    >>> buf = MessageBuffer()
+    >>> buf.feed(chunk_from_recv)
+    >>> for msg in buf.get_messages():
+    ...     handle(msg)
+    """
+
+    def __init__(self) -> None:
+        self._buffer: bytes = b""
+
+    def feed(self, data: bytes) -> None:
+        """Append raw bytes received from a socket.
+
+        Parameters
+        ----------
+        data : bytes
+            Raw bytes from ``socket.recv()``.
+        """
+        self._buffer += data
+
+    def get_messages(self) -> list[dict]:
+        """Extract and return all complete messages from the buffer.
+
+        Each complete message (terminated by ``\\n``) is decoded and
+        validated via :func:`decode_message`.  Invalid messages are
+        silently skipped so that one bad frame does not kill the
+        connection.  Any trailing bytes that do not yet form a complete
+        message are kept in the buffer for the next ``feed()`` call.
+
+        Returns
+        -------
+        list[dict]
+            Zero or more validated message dictionaries.
+        """
+        messages: list[dict] = []
+
+        while b"\n" in self._buffer:
+            line, self._buffer = self._buffer.split(b"\n", 1)
+            # Re-add the newline — decode_message expects it
+            raw_message: bytes = line + b"\n"
+            try:
+                messages.append(decode_message(raw_message))
+            except ValueError:
+                # Skip malformed messages; the connection stays alive.
+                pass
+
+        return messages
